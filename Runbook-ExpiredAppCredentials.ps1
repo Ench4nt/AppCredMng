@@ -33,9 +33,9 @@ $ErrorActionPreference = 'Stop'
 # 1. Read configuration from Automation Variables
 # ─────────────────────────────────────────────
 try {
-    $mailFrom    = Get-AutomationVariable -Name 'MailFrom'
-    $mailToRaw   = Get-AutomationVariable -Name 'MailTo'
-    $mailTo      = $mailToRaw -split '\s*,\s*'
+    $mailFrom    = [string](Get-AutomationVariable -Name 'MailFrom')
+    $mailToRaw   = [string](Get-AutomationVariable -Name 'MailTo')
+    $mailTo      = @($mailToRaw -split '\s*,\s*' | Where-Object { $_ -ne '' })
     $WarningDays = Get-AutomationVariable -Name 'WarningDays' -ErrorAction SilentlyContinue
     if (-not $WarningDays) { $WarningDays = 30 }
 }

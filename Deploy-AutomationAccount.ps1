@@ -71,11 +71,11 @@ $ErrorActionPreference = 'Stop'
 # ─────────────────────────────────────────────
 # 0. Prerequisites
 # ─────────────────────────────────────────────
-$requiredModules = @('Az.Accounts', 'Az.Resources', 'Az.Automation')
+$requiredModules = @('Az.Accounts', 'Az.Resources', 'Az.Automation', 'ExchangeOnlineManagement')
 foreach ($mod in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $mod)) {
         Write-Host "Installing $mod ..." -ForegroundColor Yellow
-        Install-Module -Name $mod -Scope CurrentUser -Force
+        Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber
     }
     Import-Module $mod
 }
@@ -86,6 +86,29 @@ if (-not $context) {
     Connect-AzAccount
 }
 Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+
+# ─────────────────────────────────────────────
+# 0.5 Ensure shared mailbox exists for MailFrom
+# ─────────────────────────────────────────────
+Write-Host "Checking if shared mailbox '$MailFrom' exists ..." -ForegroundColor Cyan
+try {
+    Connect-ExchangeOnline -ShowBanner:$false
+    $mailbox = Get-Mailbox -Identity $MailFrom -ErrorAction SilentlyContinue
+    if ($mailbox) {
+        Write-Host "Mailbox '$MailFrom' already exists (Type: $($mailbox.RecipientTypeDetails))." -ForegroundColor Green
+    }
+    else {
+        $displayName = $MailFrom.Split('@')[0]
+        Write-Host "Creating shared mailbox '$MailFrom' ..." -ForegroundColor Cyan
+        New-Mailbox -Shared -Name $displayName -PrimarySmtpAddress $MailFrom | Out-Null
+        Write-Host "Shared mailbox '$MailFrom' created." -ForegroundColor Green
+    }
+    Disconnect-ExchangeOnline -Confirm:$false | Out-Null
+}
+catch {
+    Write-Warning "Could not verify/create shared mailbox: $_"
+    Write-Warning "Ensure '$MailFrom' is a valid mailbox before running the runbook."
+}
 
 # ─────────────────────────────────────────────
 # 1. Resource Group
@@ -122,46 +145,74 @@ Write-Host "Managed Identity Principal ID: $principalId" -ForegroundColor Yellow
 # 3. Import PowerShell modules into the account
 # ─────────────────────────────────────────────
 $graphModules = @(
-    @{ Name = 'Microsoft.Graph.Authentication';  Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Authentication' }
-    @{ Name = 'Microsoft.Graph.Applications';    Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Applications' }
-    @{ Name = 'Microsoft.Graph.Users.Actions';   Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Users.Actions' }
+    @{ Name = 'Microsoft.Graph.Authentication';  Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Authentication/2.25.0' }
+    @{ Name = 'Microsoft.Graph.Applications';    Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Applications/2.25.0' }
+    @{ Name = 'Microsoft.Graph.Users.Actions';   Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Users.Actions/2.25.0' }
 )
 
-foreach ($gm in $graphModules) {
-    $existing = Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
-                                       -AutomationAccountName $AutomationAccountName `
-                                       -Name $gm.Name `
-                                       -ErrorAction SilentlyContinue
+$modulesToWait = [System.Collections.Generic.List[string]]::new()
 
-    if ($existing -and $existing.ProvisioningState -eq 'Succeeded') {
-        Write-Host "Module $($gm.Name) already imported." -ForegroundColor Green
-        continue
+foreach ($gm in $graphModules) {
+    $alreadyImported = $false
+    try {
+        $existing = Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
+                                           -AutomationAccountName $AutomationAccountName `
+                                           -Name $gm.Name
+        if ($existing -and $existing.ProvisioningState -eq 'Succeeded') {
+            Write-Host "Module $($gm.Name) already imported." -ForegroundColor Green
+            $alreadyImported = $true
+        }
+    }
+    catch {
+        # Module not found – needs importing
     }
 
-    Write-Host "Importing module $($gm.Name) (this may take a few minutes) ..." -ForegroundColor Cyan
-    New-AzAutomationModule -ResourceGroupName $ResourceGroupName `
-                           -AutomationAccountName $AutomationAccountName `
-                           -Name $gm.Name `
-                           -ContentLinkUri $gm.Uri `
-                           -RuntimeVersion '7.2' | Out-Null
+    if (-not $alreadyImported) {
+        try {
+            Write-Host "Importing module $($gm.Name) (this may take a few minutes) ..." -ForegroundColor Cyan
+            New-AzAutomationModule -ResourceGroupName $ResourceGroupName `
+                                   -AutomationAccountName $AutomationAccountName `
+                                   -Name $gm.Name `
+                                   -ContentLinkUri $gm.Uri | Out-Null
+            $modulesToWait.Add($gm.Name)
+        }
+        catch {
+            Write-Error "Failed to import module $($gm.Name): $_"
+            throw
+        }
+    }
 }
 
-# Wait for modules to finish provisioning
-Write-Host "Waiting for module provisioning ..." -ForegroundColor Cyan
-foreach ($gm in $graphModules) {
-    $attempts = 0
-    do {
-        Start-Sleep -Seconds 15
-        $modState = (Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
-                                            -AutomationAccountName $AutomationAccountName `
-                                            -Name $gm.Name).ProvisioningState
-        $attempts++
-        Write-Host "  $($gm.Name): $modState (attempt $attempts)" -ForegroundColor Gray
-    } while ($modState -notin @('Succeeded', 'Failed') -and $attempts -lt 40)
+# Wait only for newly imported modules to finish provisioning
+if ($modulesToWait.Count -gt 0) {
+    Write-Host "Waiting for module provisioning ..." -ForegroundColor Cyan
+    foreach ($modName in $modulesToWait) {
+        $attempts = 0
+        $modState = 'Unknown'
+        do {
+            Start-Sleep -Seconds 15
+            try {
+                $modState = (Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
+                                                    -AutomationAccountName $AutomationAccountName `
+                                                    -Name $modName).ProvisioningState
+            }
+            catch {
+                $modState = 'NotFound'
+            }
+            $attempts++
+            Write-Host "  ${modName}: $modState (attempt $attempts)" -ForegroundColor Gray
+        } while ($modState -notin @('Succeeded', 'Failed') -and $attempts -lt 40)
 
-    if ($modState -eq 'Failed') {
-        Write-Error "Module $($gm.Name) failed to import!"
+        if ($modState -eq 'Failed') {
+            Write-Error "Module $modName failed to import!"
+        }
+        elseif ($modState -eq 'Succeeded') {
+            Write-Host "  ${modName}: Ready." -ForegroundColor Green
+        }
     }
+}
+else {
+    Write-Host "All modules already available – skipping provisioning wait." -ForegroundColor Green
 }
 
 # ─────────────────────────────────────────────
@@ -212,7 +263,6 @@ Import-AzAutomationRunbook -ResourceGroupName $ResourceGroupName `
                            -Name $runbookName `
                            -Path $runbookPath `
                            -Type PowerShell `
-                           -RuntimeVersion '7.2' `
                            -Force | Out-Null
 
 Publish-AzAutomationRunbook -ResourceGroupName $ResourceGroupName `
@@ -226,7 +276,7 @@ Write-Host "Runbook published." -ForegroundColor Green
 # ─────────────────────────────────────────────
 $scheduleName = 'Daily-CredentialCheck'
 
-$startTime = [DateTime]::ParseExact($ScheduleTime, 'HH:mm', $null)
+$startTime = [DateTime]::Parse($ScheduleTime)
 $startDate = [DateTime]::UtcNow.Date.AddDays(1).Add($startTime.TimeOfDay)
 
 $existing = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName `

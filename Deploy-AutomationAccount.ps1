@@ -263,14 +263,16 @@ Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Yellow
 Write-Host " MANUAL STEP REQUIRED – Grant Graph permissions to Managed Identity" -ForegroundColor Yellow
 Write-Host "=================================================================" -ForegroundColor Yellow
-Write-Host @"
+
+@"
+@"
 
 Run the following in a PowerShell session with Global Admin / Privileged Role Admin rights:
 
     Connect-MgGraph -Scopes 'AppRoleAssignment.ReadWrite.All'
 
     `$miPrincipalId = '$principalId'
-    `$graphSp       = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
+    `$graphSp       = Get-MgServicePrincipal -Filter `"appId eq '00000003-0000-0000-c000-000000000000'`"
 
     # Application.Read.All
     `$appReadRole = `$graphSp.AppRoles | Where-Object Value -eq 'Application.Read.All'
@@ -287,7 +289,4 @@ Run the following in a PowerShell session with Global Admin / Privileged Role Ad
         -PrincipalId        `$miPrincipalId ``
         -ResourceId         `$graphSp.Id ``
         -AppRoleId          `$mailSendRole.Id
-
-"@ -ForegroundColor White
-
-Write-Host "Deployment complete!" -ForegroundColor Green
+"@

@@ -297,20 +297,22 @@ if ($SmtpServer) {
 }
 else {
     # ── Microsoft Graph (Send-MgUserMail) ──
-    $toRecipients = $MailTo | ForEach-Object {
+    $toRecipients = @($MailTo | ForEach-Object {
         @{ EmailAddress = @{ Address = $_ } }
-    }
+    })
 
-    $message = @{
-        Subject      = $subject
-        Body         = @{
-            ContentType = 'HTML'
-            Content     = $htmlBody
+    $mailBody = @{
+        Message = @{
+            Subject      = $subject
+            Body         = @{
+                ContentType = 'HTML'
+                Content     = $htmlBody
+            }
+            ToRecipients = $toRecipients
         }
-        ToRecipients = $toRecipients
     }
 
-    Send-MgUserMail -UserId $MailFrom -Message $message -ErrorAction Stop
+    Send-MgUserMail -UserId $MailFrom -BodyParameter $mailBody -ErrorAction Stop
     Write-Host "Alert email sent via Microsoft Graph from $MailFrom to $($MailTo -join ', ')." -ForegroundColor Green
 }
 

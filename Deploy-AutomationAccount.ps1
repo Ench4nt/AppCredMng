@@ -71,7 +71,7 @@ $ErrorActionPreference = 'Stop'
 # ─────────────────────────────────────────────
 # 0. Prerequisites
 # ─────────────────────────────────────────────
-$requiredModules = @('Az.Accounts', 'Az.Resources', 'Az.Automation', 'ExchangeOnlineManagement')
+$requiredModules = @('Az.Accounts', 'Az.Resources', 'Az.Automation')
 foreach ($mod in $requiredModules) {
     if (-not (Get-Module -ListAvailable -Name $mod)) {
         Write-Host "Installing $mod ..." -ForegroundColor Yellow
@@ -86,29 +86,6 @@ if (-not $context) {
     Connect-AzAccount
 }
 Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
-
-# ─────────────────────────────────────────────
-# 0.5 Ensure shared mailbox exists for MailFrom
-# ─────────────────────────────────────────────
-Write-Host "Checking if shared mailbox '$MailFrom' exists ..." -ForegroundColor Cyan
-try {
-    Connect-ExchangeOnline -ShowBanner:$false
-    $mailbox = Get-Mailbox -Identity $MailFrom -ErrorAction SilentlyContinue
-    if ($mailbox) {
-        Write-Host "Mailbox '$MailFrom' already exists (Type: $($mailbox.RecipientTypeDetails))." -ForegroundColor Green
-    }
-    else {
-        $displayName = $MailFrom.Split('@')[0]
-        Write-Host "Creating shared mailbox '$MailFrom' ..." -ForegroundColor Cyan
-        New-Mailbox -Shared -Name $displayName -PrimarySmtpAddress $MailFrom | Out-Null
-        Write-Host "Shared mailbox '$MailFrom' created." -ForegroundColor Green
-    }
-    Disconnect-ExchangeOnline -Confirm:$false | Out-Null
-}
-catch {
-    Write-Warning "Could not verify/create shared mailbox: $_"
-    Write-Warning "Ensure '$MailFrom' is a valid mailbox before running the runbook."
-}
 
 # ─────────────────────────────────────────────
 # 1. Resource Group

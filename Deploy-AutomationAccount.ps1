@@ -1,12 +1,13 @@
 <#
 .SYNOPSIS
-    Deploys the Azure Automation infrastructure for the expired-credentials
-    runbook: Automation Account, modules, runbook, schedule, and variables.
+    Deploys a generic Azure Automation Account with a System-Assigned
+    Managed Identity and the base Microsoft Graph Authentication module.
 
 .DESCRIPTION
-    Run this script once from your local machine (or Cloud Shell) to provision
-    everything. After deployment you still need to grant Microsoft Graph
-    permissions to the Managed Identity (step shown at the end).
+    Run this script once to provision the Automation Account infrastructure.
+    After this, use feature-specific scripts to enable individual runbooks:
+      - Enable-CredentialAlerts.ps1  (expired app credential monitoring)
+      - Enable-CAAudit.ps1          (Conditional Access policy audit)
 
 .PARAMETER SubscriptionId
     Azure subscription to deploy into.
@@ -18,28 +19,14 @@
     Azure region. Default: eastus.
 
 .PARAMETER AutomationAccountName
-    Name for the Automation Account. Default: aa-credential-monitor.
-
-.PARAMETER MailFrom
-    Sender mailbox UPN (e.g. alerts@contoso.com).
-
-.PARAMETER MailTo
-    Comma-separated list of recipient addresses.
-
-.PARAMETER WarningDays
-    Look-ahead window in days. Default: 30.
-
-.PARAMETER ScheduleTime
-    Daily run time in HH:mm (UTC). Default: 08:00.
+    Name for the Automation Account. Default: aa-entra-monitor.
 
 .EXAMPLE
     .\Deploy-AutomationAccount.ps1 `
         -SubscriptionId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ResourceGroupName "rg-credential-monitor" `
-        -AutomationAccountName "aa-credential-monitor" `
-        -MailFrom "alerts@contoso.com" `
-        -MailTo "admin@contoso.com,security@contoso.com" `
-        -ScheduleTime "08:00"
+        -ResourceGroupName "rg-entra-monitor" `
+        -Location "westeurope" `
+        -AutomationAccountName "aa-entra-monitor"
 #>
 
 [CmdletBinding()]
@@ -52,17 +39,7 @@ param(
 
     [string]$Location = 'eastus',
 
-    [string]$AutomationAccountName = 'aa-credential-monitor',
-
-    [Parameter(Mandatory)]
-    [string]$MailFrom,
-
-    [Parameter(Mandatory)]
-    [string]$MailTo,
-
-    [int]$WarningDays = 30,
-
-    [string]$ScheduleTime = '08:00'
+    [string]$AutomationAccountName = 'aa-entra-monitor'
 )
 
 Set-StrictMode -Version Latest
@@ -80,11 +57,8 @@ foreach ($mod in $requiredModules) {
     Import-Module $mod
 }
 
-# Login & set subscription
 $context = Get-AzContext
-if (-not $context) {
-    Connect-AzAccount
-}
+if (-not $context) { Connect-AzAccount }
 Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
 # ─────────────────────────────────────────────
@@ -93,6 +67,9 @@ Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
     Write-Host "Creating resource group $ResourceGroupName in $Location ..." -ForegroundColor Cyan
     New-AzResourceGroup -Name $ResourceGroupName -Location $Location | Out-Null
+}
+else {
+    Write-Host "Resource group '$ResourceGroupName' already exists." -ForegroundColor Green
 }
 
 # ─────────────────────────────────────────────
@@ -104,216 +81,71 @@ $aa = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName `
 
 if (-not $aa) {
     Write-Host "Creating Automation Account $AutomationAccountName ..." -ForegroundColor Cyan
-    $aa = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName `
-                                  -Name $AutomationAccountName `
-                                  -Location $Location `
-                                  -AssignSystemIdentity `
-                                  -Plan Basic
+    New-AzAutomationAccount -ResourceGroupName $ResourceGroupName `
+                            -Name $AutomationAccountName `
+                            -Location $Location `
+                            -AssignSystemIdentity `
+                            -Plan Basic | Out-Null
 }
 else {
-    Write-Host "Automation Account already exists." -ForegroundColor Green
+    Write-Host "Automation Account '$AutomationAccountName' already exists." -ForegroundColor Green
 }
 
 $principalId = (Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName `
                                          -Name $AutomationAccountName).Identity.PrincipalId
-Write-Host "Managed Identity Principal ID: $principalId" -ForegroundColor Yellow
 
 # ─────────────────────────────────────────────
-# 3. Import PowerShell modules into the account
+# 3. Import base Microsoft Graph Authentication module
 # ─────────────────────────────────────────────
-$graphModules = @(
-    @{ Name = 'Microsoft.Graph.Authentication';  Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Authentication/2.25.0' }
-    @{ Name = 'Microsoft.Graph.Applications';    Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Applications/2.25.0' }
-    @{ Name = 'Microsoft.Graph.Users.Actions';   Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Users.Actions/2.25.0' }
-)
+$baseModule = @{ Name = 'Microsoft.Graph.Authentication'; Uri = 'https://www.powershellgallery.com/api/v2/package/Microsoft.Graph.Authentication/2.25.0' }
 
-$modulesToWait = [System.Collections.Generic.List[string]]::new()
-
-foreach ($gm in $graphModules) {
-    $alreadyImported = $false
-    try {
-        $existing = Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
-                                           -AutomationAccountName $AutomationAccountName `
-                                           -Name $gm.Name
-        if ($existing -and $existing.ProvisioningState -eq 'Succeeded') {
-            Write-Host "Module $($gm.Name) already imported." -ForegroundColor Green
-            $alreadyImported = $true
-        }
-    }
-    catch {
-        # Module not found – needs importing
-    }
-
-    if (-not $alreadyImported) {
-        try {
-            Write-Host "Importing module $($gm.Name) (this may take a few minutes) ..." -ForegroundColor Cyan
-            New-AzAutomationModule -ResourceGroupName $ResourceGroupName `
-                                   -AutomationAccountName $AutomationAccountName `
-                                   -Name $gm.Name `
-                                   -ContentLinkUri $gm.Uri | Out-Null
-            $modulesToWait.Add($gm.Name)
-        }
-        catch {
-            Write-Error "Failed to import module $($gm.Name): $_"
-            throw
-        }
+$alreadyImported = $false
+try {
+    $existing = Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
+                                       -AutomationAccountName $AutomationAccountName `
+                                       -Name $baseModule.Name
+    if ($existing -and $existing.ProvisioningState -eq 'Succeeded') {
+        Write-Host "Module $($baseModule.Name) already imported." -ForegroundColor Green
+        $alreadyImported = $true
     }
 }
+catch { }
 
-# Wait only for newly imported modules to finish provisioning
-if ($modulesToWait.Count -gt 0) {
-    Write-Host "Waiting for module provisioning ..." -ForegroundColor Cyan
-    foreach ($modName in $modulesToWait) {
-        $attempts = 0
-        $modState = 'Unknown'
-        do {
-            Start-Sleep -Seconds 15
-            try {
-                $modState = (Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
-                                                    -AutomationAccountName $AutomationAccountName `
-                                                    -Name $modName).ProvisioningState
-            }
-            catch {
-                $modState = 'NotFound'
-            }
-            $attempts++
-            Write-Host "  ${modName}: $modState (attempt $attempts)" -ForegroundColor Gray
-        } while ($modState -notin @('Succeeded', 'Failed') -and $attempts -lt 40)
-
-        if ($modState -eq 'Failed') {
-            Write-Error "Module $modName failed to import!"
-        }
-        elseif ($modState -eq 'Succeeded') {
-            Write-Host "  ${modName}: Ready." -ForegroundColor Green
-        }
-    }
-}
-else {
-    Write-Host "All modules already available – skipping provisioning wait." -ForegroundColor Green
-}
-
-# ─────────────────────────────────────────────
-# 4. Automation Variables
-# ─────────────────────────────────────────────
-$variables = @(
-    @{ Name = 'MailFrom';     Value = $MailFrom;     Encrypted = $false }
-    @{ Name = 'MailTo';       Value = $MailTo;        Encrypted = $false }
-    @{ Name = 'WarningDays';  Value = $WarningDays;   Encrypted = $false }
-)
-
-foreach ($v in $variables) {
-    $existing = Get-AzAutomationVariable -ResourceGroupName $ResourceGroupName `
-                                         -AutomationAccountName $AutomationAccountName `
-                                         -Name $v.Name `
-                                         -ErrorAction SilentlyContinue
-    if ($existing) {
-        Set-AzAutomationVariable -ResourceGroupName $ResourceGroupName `
-                                 -AutomationAccountName $AutomationAccountName `
-                                 -Name $v.Name `
-                                 -Value $v.Value `
-                                 -Encrypted $v.Encrypted | Out-Null
-        Write-Host "Updated variable: $($v.Name)" -ForegroundColor Green
-    }
-    else {
-        New-AzAutomationVariable -ResourceGroupName $ResourceGroupName `
-                                 -AutomationAccountName $AutomationAccountName `
-                                 -Name $v.Name `
-                                 -Value $v.Value `
-                                 -Encrypted $v.Encrypted | Out-Null
-        Write-Host "Created variable: $($v.Name)" -ForegroundColor Green
-    }
-}
-
-# ─────────────────────────────────────────────
-# 5. Import the Runbook
-# ─────────────────────────────────────────────
-$runbookName = 'Check-ExpiredAppCredentials'
-$runbookPath = Join-Path $PSScriptRoot 'Runbook-ExpiredAppCredentials.ps1'
-
-if (-not (Test-Path $runbookPath)) {
-    Write-Error "Runbook script not found at $runbookPath. Place it next to this deployment script."
-}
-
-Write-Host "Importing runbook $runbookName ..." -ForegroundColor Cyan
-Import-AzAutomationRunbook -ResourceGroupName $ResourceGroupName `
+if (-not $alreadyImported) {
+    Write-Host "Importing $($baseModule.Name) ..." -ForegroundColor Cyan
+    New-AzAutomationModule -ResourceGroupName $ResourceGroupName `
                            -AutomationAccountName $AutomationAccountName `
-                           -Name $runbookName `
-                           -Path $runbookPath `
-                           -Type PowerShell `
-                           -Force | Out-Null
+                           -Name $baseModule.Name `
+                           -ContentLinkUri $baseModule.Uri | Out-Null
 
-Publish-AzAutomationRunbook -ResourceGroupName $ResourceGroupName `
-                            -AutomationAccountName $AutomationAccountName `
-                            -Name $runbookName | Out-Null
+    $attempts = 0
+    do {
+        Start-Sleep -Seconds 15
+        try {
+            $modState = (Get-AzAutomationModule -ResourceGroupName $ResourceGroupName `
+                                                -AutomationAccountName $AutomationAccountName `
+                                                -Name $baseModule.Name).ProvisioningState
+        }
+        catch { $modState = 'NotFound' }
+        $attempts++
+        Write-Host "  $($baseModule.Name): $modState (attempt $attempts)" -ForegroundColor Gray
+    } while ($modState -notin @('Succeeded', 'Failed') -and $attempts -lt 40)
 
-Write-Host "Runbook published." -ForegroundColor Green
-
-# ─────────────────────────────────────────────
-# 6. Create a daily schedule and link it
-# ─────────────────────────────────────────────
-$scheduleName = 'Daily-CredentialCheck'
-
-$startTime = [DateTime]::Parse($ScheduleTime)
-$startDate = [DateTime]::UtcNow.Date.AddDays(1).Add($startTime.TimeOfDay)
-
-$existing = Get-AzAutomationSchedule -ResourceGroupName $ResourceGroupName `
-                                     -AutomationAccountName $AutomationAccountName `
-                                     -Name $scheduleName `
-                                     -ErrorAction SilentlyContinue
-
-if (-not $existing) {
-    Write-Host "Creating daily schedule at $ScheduleTime UTC ..." -ForegroundColor Cyan
-    New-AzAutomationSchedule -ResourceGroupName $ResourceGroupName `
-                             -AutomationAccountName $AutomationAccountName `
-                             -Name $scheduleName `
-                             -StartTime $startDate `
-                             -DayInterval 1 `
-                             -TimeZone 'UTC' | Out-Null
-}
-else {
-    Write-Host "Schedule '$scheduleName' already exists." -ForegroundColor Green
+    if ($modState -eq 'Failed') { Write-Error "Base module failed to import!" }
 }
 
-# Link schedule → runbook
-Register-AzAutomationScheduledRunbook -ResourceGroupName $ResourceGroupName `
-                                      -AutomationAccountName $AutomationAccountName `
-                                      -RunbookName $runbookName `
-                                      -ScheduleName $scheduleName `
-                                      -ErrorAction SilentlyContinue | Out-Null
-
-Write-Host "Schedule linked to runbook." -ForegroundColor Green
-
 # ─────────────────────────────────────────────
-# 7. Instructions for granting Graph permissions
+# 4. Summary
 # ─────────────────────────────────────────────
 Write-Host ""
-Write-Host "=================================================================" -ForegroundColor Yellow
-Write-Host " MANUAL STEP REQUIRED – Grant Graph permissions to Managed Identity" -ForegroundColor Yellow
-Write-Host "=================================================================" -ForegroundColor Yellow
-
-@"
-@"
-
-Run the following in a PowerShell session with Global Admin / Privileged Role Admin rights:
-
-    Connect-MgGraph -Scopes 'AppRoleAssignment.ReadWrite.All'
-
-    `$miPrincipalId = '$principalId'
-    `$graphSp       = Get-MgServicePrincipal -Filter `"appId eq '00000003-0000-0000-c000-000000000000'`"
-
-    # Application.Read.All
-    `$appReadRole = `$graphSp.AppRoles | Where-Object Value -eq 'Application.Read.All'
-    New-MgServicePrincipalAppRoleAssignment ``
-        -ServicePrincipalId `$miPrincipalId ``
-        -PrincipalId        `$miPrincipalId ``
-        -ResourceId         `$graphSp.Id ``
-        -AppRoleId          `$appReadRole.Id
-
-    # Mail.Send
-    `$mailSendRole = `$graphSp.AppRoles | Where-Object Value -eq 'Mail.Send'
-    New-MgServicePrincipalAppRoleAssignment ``
-        -ServicePrincipalId `$miPrincipalId ``
-        -PrincipalId        `$miPrincipalId ``
-        -ResourceId         `$graphSp.Id ``
-        -AppRoleId          `$mailSendRole.Id
-"@
+Write-Host "=================================================================" -ForegroundColor Green
+Write-Host " Automation Account Ready" -ForegroundColor Green
+Write-Host "=================================================================" -ForegroundColor Green
+Write-Host "  Resource Group:      $ResourceGroupName" -ForegroundColor White
+Write-Host "  Automation Account:  $AutomationAccountName" -ForegroundColor White
+Write-Host "  Managed Identity:    $principalId" -ForegroundColor White
+Write-Host ""
+Write-Host "Next steps — enable features by running:" -ForegroundColor Yellow
+Write-Host "  .\Enable-CredentialAlerts.ps1 -ResourceGroupName '$ResourceGroupName' -AutomationAccountName '$AutomationAccountName' ..." -ForegroundColor Cyan
+Write-Host "  .\Enable-CAAudit.ps1          -ResourceGroupName '$ResourceGroupName' -AutomationAccountName '$AutomationAccountName' ..." -ForegroundColor Cyan
+Write-Host ""

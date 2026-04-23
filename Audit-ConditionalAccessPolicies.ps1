@@ -63,7 +63,8 @@ param(
     [int]$ReportOnlyThresholdDays = 60,
     [int]$DisabledThresholdDays = 30,
     [int]$LargeGroupThreshold = 50,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [switch]$SkipAuth
 )
 
 Set-StrictMode -Version Latest
@@ -102,7 +103,14 @@ $graphScopes = @(
     'Mail.Send'
 )
 
-if ($ClientSecret -and $ClientId -and $TenantId) {
+if ($SkipAuth) {
+    $ctx = Get-MgContext
+    if (-not $ctx) {
+        throw "No existing Microsoft Graph session found. Run Connect-MgGraph first or remove -SkipAuth."
+    }
+    Write-Host "Using existing Graph session ($($ctx.Account))." -ForegroundColor Green
+}
+elseif ($ClientSecret -and $ClientId -and $TenantId) {
     $secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
     $credential   = [PSCredential]::new($ClientId, $secureSecret)
     Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential -NoWelcome
